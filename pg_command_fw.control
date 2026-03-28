@@ -1,0 +1,6 @@
+comment = 'pg_command_fw:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_command_fw'
+relocatable = false
+superuser = true
+trusted = false
