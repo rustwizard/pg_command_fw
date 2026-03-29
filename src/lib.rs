@@ -406,7 +406,7 @@ fn write_audit_log(
                 DatumWithOid::from(block_reason),
             ];
             let _ = client.update(
-                "INSERT INTO pg_command_fw.audit_log \
+                "INSERT INTO command_fw.audit_log \
                  (session_user_name, current_user_name, query_text, command_type, \
                   target_schema, target_object, client_addr, application_name, \
                   blocked, block_reason) \
@@ -835,21 +835,21 @@ mod tests {
     #[pg_test]
     fn test_audit_log_is_writable() {
         Spi::run(
-            "INSERT INTO pg_command_fw.audit_log \
+            "INSERT INTO command_fw.audit_log \
              (session_user_name, current_user_name, query_text, \
               command_type, blocked) \
              VALUES ('u', 'u', 'TRUNCATE t', 'TRUNCATE', false)",
         )
         .unwrap();
         let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM pg_command_fw.audit_log \
+            "SELECT count(*) FROM command_fw.audit_log \
              WHERE query_text = 'TRUNCATE t'",
         )
         .unwrap()
         .unwrap();
         assert_eq!(count, 1);
         Spi::run(
-            "DELETE FROM pg_command_fw.audit_log \
+            "DELETE FROM command_fw.audit_log \
              WHERE query_text = 'TRUNCATE t'",
         )
         .unwrap();

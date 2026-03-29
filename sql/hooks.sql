@@ -2,7 +2,7 @@
 -- To activate for all connections, add to postgresql.conf:
 --   shared_preload_libraries = 'pg_command_fw'
 
-CREATE SCHEMA IF NOT EXISTS pg_command_fw;
+CREATE SCHEMA IF NOT EXISTS command_fw;
 
 -- Audit log for all intercepted DDL/utility commands.
 --
@@ -10,7 +10,7 @@ CREATE SCHEMA IF NOT EXISTS pg_command_fw;
 -- so it will be rolled back when the current transaction aborts.  The server log
 -- (LOG: blocked ...) is the authoritative record for blocked events.
 -- Allowed commands commit normally and their rows persist here.
-CREATE TABLE pg_command_fw.audit_log (
+CREATE TABLE command_fw.audit_log (
     id                bigserial   NOT NULL,
     -- clock_timestamp() captures the actual wall-clock time; now() would give
     -- the transaction start time, which is the same row for every statement in
@@ -39,15 +39,15 @@ CREATE TABLE pg_command_fw.audit_log (
 );
 
 -- Index for time-range queries and dashboards.
-CREATE INDEX ON pg_command_fw.audit_log (ts);
+CREATE INDEX ON command_fw.audit_log (ts);
 -- Index for per-user audits.
-CREATE INDEX ON pg_command_fw.audit_log (current_user_name);
+CREATE INDEX ON command_fw.audit_log (current_user_name);
 -- Index for per-command-type queries.
-CREATE INDEX ON pg_command_fw.audit_log (command_type);
+CREATE INDEX ON command_fw.audit_log (command_type);
 -- Partial index: fast scan of blocked-only events (typically a small fraction).
-CREATE INDEX ON pg_command_fw.audit_log (ts) WHERE blocked;
+CREATE INDEX ON command_fw.audit_log (ts) WHERE blocked;
 
 -- Lock down the schema and table; superusers can explicitly grant SELECT to
 -- monitoring roles as needed.
-REVOKE ALL ON SCHEMA pg_command_fw FROM PUBLIC;
-REVOKE ALL ON pg_command_fw.audit_log FROM PUBLIC;
+REVOKE ALL ON SCHEMA command_fw FROM PUBLIC;
+REVOKE ALL ON command_fw.audit_log FROM PUBLIC;
