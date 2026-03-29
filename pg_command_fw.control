@@ -1,4 +1,4 @@
-comment = 'pg_command_fw:  Created by pgrx'
+comment = 'pg_command_fw: ProcessUtility hook firewall for DDL/utility commands (TRUNCATE, DROP TABLE, ALTER SYSTEM, LOAD, COPY PROGRAM)'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_command_fw'
 relocatable = false

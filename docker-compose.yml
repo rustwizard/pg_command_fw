@@ -1,0 +1,27 @@
+services:
+  postgres:
+    build: .
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    # Load the extension at startup so the hook is active for all connections
+    command: postgres -c shared_preload_libraries=pg_command_fw
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  test:
+    image: postgres:17-trixie
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: testdb
+    volumes:
+      - ./tests/docker/test.sh:/test.sh:ro
+    entrypoint: ["/bin/bash", "/test.sh"]
