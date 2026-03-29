@@ -27,6 +27,8 @@ static BLOCK_ALTER_SYSTEM: GucSetting<bool> = GucSetting::<bool>::new(true);
 static BLOCK_LOAD: GucSetting<bool> = GucSetting::<bool>::new(true);
 // COPY TO/FROM PROGRAM: blocked for all users including superusers.
 static BLOCK_COPY_PROGRAM: GucSetting<bool> = GucSetting::<bool>::new(true);
+// COPY (plain, non-PROGRAM): blocked for non-superusers (opt-in).
+static BLOCK_COPY: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 // Cross-category settings
 // Comma-separated list of roles that are always blocked, including superusers.
@@ -76,22 +78,37 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     let in_blocked_list = is_role_blocked(current_user);
     let is_super = pg_sys::superuser();
 
-    // COPY TO/FROM PROGRAM
+    // COPY TO/FROM PROGRAM or plain COPY
     if is_a(node, pg_sys::NodeTag::T_CopyStmt) {
         let copy_stmt = node as *mut pg_sys::CopyStmt;
-        if !(*copy_stmt).is_program {
-            // Plain COPY TO/FROM file — not in scope for this extension.
+        if (*copy_stmt).is_program {
+            let block_reason = if in_blocked_list {
+                Some("role_listed")
+            } else if BLOCK_COPY_PROGRAM.get() {
+                Some("copy_program")
+            } else {
+                None
+            };
+            return Some(FirewallDecision {
+                command_type: "COPY_PROGRAM",
+                target_schema: None,
+                target_object: None,
+                block_reason,
+            });
+        }
+        // Plain COPY (to/from file or stdout)
+        if !BLOCK_COPY.get() && !in_blocked_list {
             return None;
         }
         let block_reason = if in_blocked_list {
             Some("role_listed")
-        } else if BLOCK_COPY_PROGRAM.get() {
-            Some("copy_program")
+        } else if BLOCK_COPY.get() && !is_super {
+            Some("copy")
         } else {
             None
         };
         return Some(FirewallDecision {
-            command_type: "COPY_PROGRAM",
+            command_type: "COPY",
             target_schema: None,
             target_object: None,
             block_reason,
@@ -551,6 +568,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pg_command_fw.block_copy",
+        c"Block plain COPY (non-PROGRAM) for non-superusers (opt-in)",
+        c"When on, COPY TO/FROM file or stdout is blocked for non-superusers.  \
+          Superusers are exempt unless listed in pg_command_fw.blocked_roles.",
+        &BLOCK_COPY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_string_guc(
         c"pg_command_fw.blocked_roles",
         c"Comma-separated list of roles always blocked from firewall-governed commands",
@@ -773,6 +800,19 @@ mod tests {
         assert_eq!(show("pg_command_fw.block_copy_program"), "off");
         Spi::run("SET pg_command_fw.block_copy_program = on").unwrap();
         assert_eq!(show("pg_command_fw.block_copy_program"), "on");
+    }
+
+    #[pg_test]
+    fn test_guc_block_copy_default_off() {
+        assert_eq!(show("pg_command_fw.block_copy"), "off");
+    }
+
+    #[pg_test]
+    fn test_guc_block_copy_roundtrip() {
+        Spi::run("SET pg_command_fw.block_copy = on").unwrap();
+        assert_eq!(show("pg_command_fw.block_copy"), "on");
+        Spi::run("SET pg_command_fw.block_copy = off").unwrap();
+        assert_eq!(show("pg_command_fw.block_copy"), "off");
     }
 
     #[pg_test]

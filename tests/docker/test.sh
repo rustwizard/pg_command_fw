@@ -128,7 +128,7 @@ else
 fi
 
 echo ""
-echo "--- Test 10: plain COPY (not PROGRAM) is unaffected ---"
+echo "--- Test 10: plain COPY (not PROGRAM) is unaffected by default ---"
 out=$($SU -c "COPY (SELECT 1) TO STDOUT;" 2>&1)
 if echo "$out" | grep -q "^1$"; then
     pass "plain COPY TO STDOUT unaffected"
@@ -137,10 +137,55 @@ else
 fi
 
 echo ""
+echo "=== COPY (plain) ==="
+
+echo ""
+echo "--- Test 11: block_copy=off (default) -> non-superuser plain COPY allowed ---"
+out=$(PGPASSWORD=testpass $RU -c "COPY (SELECT 1) TO STDOUT;" 2>&1)
+if ! echo "$out" | grep -q "not allowed"; then
+    pass "non-superuser plain COPY allowed when block_copy=off"
+else
+    fail "non-superuser plain COPY blocked when block_copy=off; got: $out"
+fi
+
+echo ""
+echo "--- Test 12: block_copy=on -> non-superuser plain COPY blocked ---"
+psql -c "ALTER ROLE testuser SET pg_command_fw.block_copy = on;"
+out=$(PGPASSWORD=testpass $RU -c "COPY (SELECT 1) TO STDOUT;" 2>&1 || true)
+if echo "$out" | grep -q "COPY command is not allowed"; then
+    pass "non-superuser plain COPY blocked when block_copy=on"
+else
+    fail "non-superuser plain COPY not blocked when block_copy=on; got: $out"
+fi
+psql -c "ALTER ROLE testuser RESET pg_command_fw.block_copy;"
+
+echo ""
+echo "--- Test 13: block_copy=on -> superuser plain COPY still allowed ---"
+out=$($SU -c "SET pg_command_fw.block_copy = on; COPY (SELECT 1) TO STDOUT;" 2>&1)
+if ! echo "$out" | grep -q "not allowed"; then
+    pass "superuser plain COPY allowed when block_copy=on"
+else
+    fail "superuser plain COPY blocked when block_copy=on; got: $out"
+fi
+
+echo ""
+echo "--- Test 14: block_copy=on + enabled=off -> non-superuser plain COPY allowed ---"
+psql -c "ALTER ROLE testuser SET pg_command_fw.block_copy = on;"
+psql -c "ALTER ROLE testuser SET pg_command_fw.enabled = off;"
+out=$(PGPASSWORD=testpass $RU -c "COPY (SELECT 1) TO STDOUT;" 2>&1)
+if ! echo "$out" | grep -q "not allowed"; then
+    pass "non-superuser plain COPY allowed when firewall disabled"
+else
+    fail "non-superuser plain COPY blocked when firewall disabled; got: $out"
+fi
+psql -c "ALTER ROLE testuser RESET pg_command_fw.block_copy;"
+psql -c "ALTER ROLE testuser RESET pg_command_fw.enabled;"
+
+echo ""
 echo "=== LOAD ==="
 
 echo ""
-echo "--- Test 11: superuser LOAD is blocked ---"
+echo "--- Test 15: superuser LOAD is blocked ---"
 out=$($SU -c "LOAD 'no_such_lib';" 2>&1 || true)
 if echo "$out" | grep -q "LOAD command is not allowed"; then
     pass "superuser LOAD blocked"
@@ -149,7 +194,7 @@ else
 fi
 
 echo ""
-echo "--- Test 12: block_load=off -> LOAD proceeds (may fail for missing lib) ---"
+echo "--- Test 16: block_load=off -> LOAD proceeds (may fail for missing lib) ---"
 out=$($SU -c "SET pg_command_fw.block_load = off; LOAD 'no_such_lib';" 2>&1 || true)
 if ! echo "$out" | grep -q "LOAD command is not allowed"; then
     pass "LOAD not blocked by firewall when block_load=off"
@@ -161,7 +206,7 @@ echo ""
 echo "=== DROP TABLE ==="
 
 echo ""
-echo "--- Test 13: block_drop_table=off (default) -> non-superuser DROP TABLE allowed ---"
+echo "--- Test 17: block_drop_table=off (default) -> non-superuser DROP TABLE allowed ---"
 psql -c "CREATE TABLE IF NOT EXISTS drop_test (id int);"
 psql -c "GRANT DROP ON TABLE drop_test TO testuser;" 2>/dev/null || \
 psql -c "ALTER TABLE drop_test OWNER TO testuser;"
@@ -173,7 +218,7 @@ else
 fi
 
 echo ""
-echo "--- Test 14: block_drop_table=on -> non-superuser DROP TABLE blocked ---"
+echo "--- Test 18: block_drop_table=on -> non-superuser DROP TABLE blocked ---"
 psql -c "CREATE TABLE IF NOT EXISTS drop_test (id int);"
 psql -c "ALTER TABLE drop_test OWNER TO testuser;"
 psql -c "ALTER ROLE testuser SET pg_command_fw.block_drop_table = on;"
@@ -187,7 +232,7 @@ psql -c "ALTER ROLE testuser RESET pg_command_fw.block_drop_table;"
 psql -c "DROP TABLE IF EXISTS drop_test;"
 
 echo ""
-echo "--- Test 15: production_schemas set -> non-superuser DROP on production schema blocked ---"
+echo "--- Test 19: production_schemas set -> non-superuser DROP on production schema blocked ---"
 psql -c "CREATE SCHEMA IF NOT EXISTS prod;"
 psql -c "CREATE TABLE prod.important (id int);"
 psql -c "GRANT USAGE ON SCHEMA prod TO testuser;"
@@ -209,7 +254,7 @@ echo ""
 echo "=== Master switch ==="
 
 echo ""
-echo "--- Test 16: enabled=off -> TRUNCATE allowed for non-superuser ---"
+echo "--- Test 20: enabled=off -> TRUNCATE allowed for non-superuser ---"
 psql -c "CREATE TABLE IF NOT EXISTS trunc_master (id int);"
 psql -c "GRANT TRUNCATE ON trunc_master TO testuser;"
 psql -c "ALTER ROLE testuser SET pg_command_fw.enabled = off;"
@@ -226,7 +271,7 @@ echo ""
 echo "=== blocked_roles ==="
 
 echo ""
-echo "--- Test 17: superuser in blocked_roles is blocked for TRUNCATE ---"
+echo "--- Test 21: superuser in blocked_roles is blocked for TRUNCATE ---"
 psql -c "CREATE TABLE IF NOT EXISTS blocked_roles_test (id int);"
 out=$($SU -c "SET pg_command_fw.blocked_roles = 'postgres'; TRUNCATE blocked_roles_test;" 2>&1 || true)
 if echo "$out" | grep -q "TRUNCATE command is not allowed"; then
@@ -240,7 +285,7 @@ echo ""
 echo "=== hint GUC ==="
 
 echo ""
-echo "--- Test 18: hint is shown in error message ---"
+echo "--- Test 22: hint is shown in error message ---"
 psql -c "CREATE TABLE IF NOT EXISTS hint_test (id int);"
 psql -c "GRANT TRUNCATE ON hint_test TO testuser;"
 psql -c "ALTER ROLE testuser SET pg_command_fw.hint = 'Contact your DBA';"
@@ -257,7 +302,7 @@ echo ""
 echo "=== Audit log ==="
 
 echo ""
-echo "--- Test 19: allowed TRUNCATE creates audit_log row ---"
+echo "--- Test 23: allowed TRUNCATE creates audit_log row ---"
 psql -c "TRUNCATE command_fw.audit_log;"
 psql -c "CREATE TABLE IF NOT EXISTS audit_trunc (id int);"
 psql -c "TRUNCATE audit_trunc;"
@@ -270,7 +315,7 @@ fi
 psql -c "DROP TABLE audit_trunc;"
 
 echo ""
-echo "--- Test 20: blocked COPY PROGRAM does not persist in audit_log (tx rollback) ---"
+echo "--- Test 24: blocked COPY PROGRAM does not persist in audit_log (tx rollback) ---"
 psql -c "TRUNCATE command_fw.audit_log;"
 $SU -c "COPY (SELECT 1) TO PROGRAM 'cat';" 2>/dev/null || true
 count=$(q "SELECT count(*) FROM command_fw.audit_log WHERE blocked;")
@@ -281,7 +326,7 @@ else
 fi
 
 echo ""
-echo "--- Test 21: audit_log_enabled=off suppresses writes ---"
+echo "--- Test 25: audit_log_enabled=off suppresses writes ---"
 psql -c "TRUNCATE command_fw.audit_log;"
 psql -c "CREATE TABLE IF NOT EXISTS audit_off_test (id int);"
 psql -c "SET pg_command_fw.audit_log_enabled = off; TRUNCATE audit_off_test;"
@@ -294,7 +339,7 @@ fi
 psql -c "DROP TABLE audit_off_test;"
 
 echo ""
-echo "--- Test 22: audit_log records command_type and blocked correctly ---"
+echo "--- Test 26: audit_log records command_type and blocked correctly ---"
 psql -c "TRUNCATE command_fw.audit_log;"
 psql -c "CREATE TABLE IF NOT EXISTS audit_type_test (id int);"
 psql -c "TRUNCATE audit_type_test;"
@@ -307,7 +352,7 @@ fi
 psql -c "DROP TABLE audit_type_test;"
 
 echo ""
-echo "--- Test 23: audit_log records session_user_name ---"
+echo "--- Test 27: audit_log records session_user_name ---"
 user=$(q "SELECT session_user_name FROM command_fw.audit_log ORDER BY id DESC LIMIT 1;")
 if [ "$user" = "postgres" ]; then
     pass "audit_log records session_user_name=postgres"
@@ -319,7 +364,7 @@ echo ""
 echo "=== Regular SQL unaffected ==="
 
 echo ""
-echo "--- Test 24: SELECT works ---"
+echo "--- Test 28: SELECT works ---"
 result=$(psql -t -A -c "SELECT 42;")
 if [ "$result" = "42" ]; then
     pass "Regular SELECT works"
@@ -328,7 +373,7 @@ else
 fi
 
 echo ""
-echo "--- Test 25: CREATE TABLE / INSERT / SELECT work ---"
+echo "--- Test 29: CREATE TABLE / INSERT / SELECT work ---"
 count=$(psql -t -A <<'SQL' | tail -1
 CREATE TEMP TABLE _docker_test (id int);
 INSERT INTO _docker_test VALUES (1), (2), (3);
