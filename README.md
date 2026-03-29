@@ -2,6 +2,51 @@
 
 A PostgreSQL extension that intercepts and optionally blocks DDL and utility commands via a `ProcessUtility` hook. Each command category is independently controlled by a GUC flag.
 
+## Building
+
+The extension is built with [pgrx](https://github.com/pgcentralfoundation/pgrx).
+
+**Prerequisites:** Rust toolchain, `clang`, PostgreSQL server dev headers.
+
+```bash
+cargo install cargo-pgrx --version 0.17.0 --locked
+cargo pgrx init          # downloads and configures a managed PostgreSQL instance
+```
+
+Build for a specific PostgreSQL version (13–18):
+
+```bash
+cargo build --features pg17
+```
+
+Produce an installable package (`.so` + extension files):
+
+```bash
+cargo pgrx package --features pg17
+```
+
+## Running tests
+
+### Unit tests (pgrx managed instance)
+
+Spins up a temporary PostgreSQL process, runs all `#[pg_test]` functions, then shuts it down:
+
+```bash
+cargo pgrx test --features pg17
+```
+
+To run against a different PostgreSQL version replace `pg17` with `pg13`–`pg18`.
+
+### Integration tests (Docker)
+
+Builds the extension inside Docker and runs the full integration suite in `tests/docker/test.sh` against a real PostgreSQL 17 instance:
+
+```bash
+docker compose up --build --abort-on-container-exit --exit-code-from test
+```
+
+This is the same command run by CI on every push.
+
 ## Installation
 
 Add to `postgresql.conf`:
