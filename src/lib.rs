@@ -207,7 +207,7 @@ unsafe fn compute_drop_table_decision(
             let prod_list: Vec<&str> = schemas_str.split(',').map(str::trim).collect();
             let explicit_schemas = extract_schemas_from_drop_stmt(drop_stmt);
             for schema in explicit_schemas {
-                if prod_list.iter().any(|&s| s == schema.as_str()) {
+                if prod_list.contains(&schema.as_str()) {
                     return (Some(schema), Some("drop_production_table"));
                 }
             }
