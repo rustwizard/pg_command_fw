@@ -20,8 +20,7 @@ static BLOCK_TRUNCATE: GucSetting<bool> = GucSetting::<bool>::new(true);
 static BLOCK_DROP_TABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Comma-separated list of production schemas for DROP TABLE checks.
 // When empty and block_drop_table=on, ALL DROP TABLE is blocked for non-superusers.
-static PRODUCTION_SCHEMAS: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static PRODUCTION_SCHEMAS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 // ALTER SYSTEM: blocked for all users including superusers.
 static BLOCK_ALTER_SYSTEM: GucSetting<bool> = GucSetting::<bool>::new(true);
 // LOAD: blocked for all users including superusers.
@@ -319,11 +318,8 @@ unsafe fn command_firewall_process_utility(args: ProcessUtilityArgs) {
                 let hint = HINT
                     .get()
                     .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
-                let mut report = ErrorReport::new(
-                    PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-                    msg,
-                    "",
-                );
+                let mut report =
+                    ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
                 if let Some(h) = hint {
                     report = report.set_hint(h);
                 }
