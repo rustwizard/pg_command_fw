@@ -1,30 +1,30 @@
 # Stage 1: Build the extension using pgrx
 FROM rust:1-trixie AS builder
 
-# Add the official PostgreSQL apt repository so postgresql-server-dev-17 is available
+# Disable incremental compilation and enable sparse registry to reduce disk usage
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+# postgresql-server-dev-17 is available in Debian trixie's default repositories
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    gnupg \
-    lsb-release \
-    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-       | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] \
-       https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-       > /etc/apt/sources.list.d/pgdg.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
     postgresql-server-dev-17 \
     clang \
     libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-pgrx --version 0.17.0 --locked
+# Install cargo-pgrx, then immediately purge the downloaded crate registry to free space
+RUN cargo install cargo-pgrx --version 0.17.0 --locked && \
+    rm -rf /root/.cargo/registry/src /root/.cargo/registry/cache
 
 WORKDIR /build
 COPY . .
 
-# Register system pg17 with pgrx (no download needed), then package the extension
+# Register system pg17 with pgrx (no download needed), then package the extension.
+# Override the release profile to use thin LTO so the linker does not exhaust /tmp.
 RUN cargo pgrx init --pg17 /usr/bin/pg_config && \
+    CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     cargo pgrx package --pg-config /usr/bin/pg_config --features pg17
 
 # Stage 2: PostgreSQL 17 with the extension installed

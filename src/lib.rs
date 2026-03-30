@@ -29,6 +29,8 @@ static BLOCK_LOAD: GucSetting<bool> = GucSetting::<bool>::new(true);
 static BLOCK_COPY_PROGRAM: GucSetting<bool> = GucSetting::<bool>::new(true);
 // COPY (plain, non-PROGRAM): blocked for non-superusers (opt-in).
 static BLOCK_COPY: GucSetting<bool> = GucSetting::<bool>::new(false);
+// pg_read_file / pg_read_binary_file / pg_stat_file: blocked for all users including superusers.
+static BLOCK_READ_FILE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // Cross-category settings
 // Comma-separated list of roles that are always blocked, including superusers.
@@ -41,6 +43,7 @@ static HINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(No
 static AUDIT_LOG_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
+static mut PREV_FMGR_HOOK: pg_sys::fmgr_hook_type = None;
 
 // Hook argument bundle
 struct ProcessUtilityArgs {
@@ -285,6 +288,109 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
         .to_str()
         .ok()
         .map(|v| v.to_owned())
+}
+
+// FunctionManager hook for pg_read_file / pg_read_binary_file / pg_stat_file
+/// Returns the audit log command_type label if `fn_oid` is a file-access function
+/// in pg_catalog that we want to intercept, or `None` otherwise.
+unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> {
+    let tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(fn_oid),
+    );
+    if tuple.is_null() {
+        return None;
+    }
+    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+    let pronamespace = (*proc_form).pronamespace;
+    // Must be pg_catalog (OID 11).
+    if pronamespace != pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE) {
+        pg_sys::ReleaseSysCache(tuple);
+        return None;
+    }
+    let name_cstr =
+        std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
+    let result = match name_cstr.to_str().unwrap_or("") {
+        "pg_read_file" | "pg_read_binary_file" => Some("READ_FILE"),
+        "pg_stat_file" => Some("STAT_FILE"),
+        _ => None,
+    };
+    pg_sys::ReleaseSysCache(tuple);
+    result
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn fmgr_hook_trampoline(
+    event: pg_sys::FmgrHookEventType::Type,
+    flinfo: *mut pg_sys::FmgrInfo,
+    arg: *mut pg_sys::Datum,
+) {
+    // Chain previous hook first for all events so prior hooks get proper START/END/ABORT.
+    if let Some(prev) = PREV_FMGR_HOOK {
+        prev(event, flinfo, arg);
+    }
+
+    if event != pg_sys::FmgrHookEventType::FHET_START {
+        return;
+    }
+    if !FW_ENABLED.get() || !BLOCK_READ_FILE.get() {
+        return;
+    }
+
+    let command_type = match file_access_command_type((*flinfo).fn_oid) {
+        Some(ct) => ct,
+        None => return,
+    };
+
+    let current_user = get_current_username().unwrap_or_else(|| "unknown".to_string());
+    let session_user = get_session_username().unwrap_or_else(|| "unknown".to_string());
+    let in_blocked_list = is_role_blocked(&current_user);
+
+    let block_reason = if in_blocked_list {
+        Some("role_listed")
+    } else {
+        Some("read_file")
+    };
+
+    let query_text = if !pg_sys::debug_query_string.is_null() {
+        std::ffi::CStr::from_ptr(pg_sys::debug_query_string)
+            .to_str()
+            .unwrap_or("<non-utf8 query>")
+    } else {
+        "<unknown>"
+    };
+
+    write_audit_log(
+        &session_user,
+        &current_user,
+        query_text,
+        command_type,
+        None,
+        None,
+        true,
+        block_reason,
+    );
+
+    pgrx::log!(
+        "blocked {} user={:?} reason={:?}",
+        command_type,
+        current_user,
+        block_reason.unwrap_or(""),
+    );
+
+    let msg = format!(
+        "{} command is not allowed",
+        command_type.replace('_', " ")
+    );
+    let hint = HINT
+        .get()
+        .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
+    let mut report =
+        ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
+    if let Some(h) = hint {
+        report = report.set_hint(h);
+    }
+    report.report(PgLogLevel::ERROR);
 }
 
 // Role helper
@@ -578,6 +684,18 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pg_command_fw.block_read_file",
+        c"Block pg_read_file / pg_read_binary_file / pg_stat_file for all users",
+        c"When on (default), calls to pg_read_file(), pg_read_binary_file(), and \
+          pg_stat_file() are blocked for every role including superusers.  These \
+          functions allow reading arbitrary server-side files and represent the same \
+          data-exfiltration threat as COPY TO FILE.",
+        &BLOCK_READ_FILE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_string_guc(
         c"pg_command_fw.blocked_roles",
         c"Comma-separated list of roles always blocked from firewall-governed commands",
@@ -613,6 +731,9 @@ pub extern "C-unwind" fn _PG_init() {
     unsafe {
         PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
         pg_sys::ProcessUtility_hook = Some(hook_trampoline);
+
+        PREV_FMGR_HOOK = pg_sys::fmgr_hook;
+        pg_sys::fmgr_hook = Some(fmgr_hook_trampoline);
     }
 }
 
@@ -830,6 +951,20 @@ mod tests {
         Spi::run("SET pg_command_fw.audit_log_enabled = on").unwrap();
         assert_eq!(show("pg_command_fw.audit_log_enabled"), "on");
     }
+
+    #[pg_test]
+    fn test_guc_block_read_file_default_on() {
+        assert_eq!(show("pg_command_fw.block_read_file"), "on");
+    }
+
+    #[pg_test]
+    fn test_guc_block_read_file_roundtrip() {
+        Spi::run("SET pg_command_fw.block_read_file = off").unwrap();
+        assert_eq!(show("pg_command_fw.block_read_file"), "off");
+        Spi::run("SET pg_command_fw.block_read_file = on").unwrap();
+        assert_eq!(show("pg_command_fw.block_read_file"), "on");
+    }
+
 
     // Audit log table structure
     #[pg_test]

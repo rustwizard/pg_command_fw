@@ -361,10 +361,78 @@ else
 fi
 
 echo ""
+echo "=== pg_read_file / pg_read_binary_file / pg_stat_file ==="
+
+echo ""
+echo "--- Test 28: superuser pg_read_file is blocked by default ---"
+out=$($SU -c "SELECT pg_read_file('PG_VERSION');" 2>&1 || true)
+if echo "$out" | grep -q "READ FILE command is not allowed"; then
+    pass "superuser pg_read_file blocked by default"
+else
+    fail "superuser pg_read_file not blocked; got: $out"
+fi
+
+echo ""
+echo "--- Test 29: non-superuser pg_read_file is blocked by default ---"
+out=$(PGPASSWORD=testpass $RU -c "SELECT pg_read_file('PG_VERSION');" 2>&1 || true)
+if echo "$out" | grep -q "READ FILE command is not allowed\|must be superuser\|permission denied"; then
+    pass "non-superuser pg_read_file blocked"
+else
+    fail "non-superuser pg_read_file not blocked; got: $out"
+fi
+
+echo ""
+echo "--- Test 30: superuser pg_read_binary_file is blocked by default ---"
+out=$($SU -c "SELECT pg_read_binary_file('PG_VERSION');" 2>&1 || true)
+if echo "$out" | grep -q "READ FILE command is not allowed"; then
+    pass "superuser pg_read_binary_file blocked by default"
+else
+    fail "superuser pg_read_binary_file not blocked; got: $out"
+fi
+
+echo ""
+echo "--- Test 31: superuser pg_stat_file is blocked by default ---"
+out=$($SU -c "SELECT pg_stat_file('PG_VERSION');" 2>&1 || true)
+if echo "$out" | grep -q "STAT FILE command is not allowed"; then
+    pass "superuser pg_stat_file blocked by default"
+else
+    fail "superuser pg_stat_file not blocked; got: $out"
+fi
+
+echo ""
+echo "--- Test 32: block_read_file=off -> superuser pg_read_file allowed ---"
+out=$($SU -c "SET pg_command_fw.block_read_file = off; SELECT pg_read_file('PG_VERSION');" 2>&1)
+if ! echo "$out" | grep -q "not allowed"; then
+    pass "superuser pg_read_file allowed when block_read_file=off"
+else
+    fail "superuser pg_read_file blocked when block_read_file=off; got: $out"
+fi
+
+echo ""
+echo "--- Test 33: enabled=off -> superuser pg_read_file allowed ---"
+out=$($SU -c "SET pg_command_fw.enabled = off; SELECT pg_read_file('PG_VERSION');" 2>&1)
+if ! echo "$out" | grep -q "not allowed"; then
+    pass "superuser pg_read_file allowed when firewall disabled"
+else
+    fail "superuser pg_read_file blocked when firewall disabled; got: $out"
+fi
+
+echo ""
+echo "--- Test 34: blocked pg_read_file recorded in server log, not in audit_log ---"
+psql -c "TRUNCATE command_fw.audit_log;"
+$SU -c "SELECT pg_read_file('PG_VERSION');" 2>/dev/null || true
+count=$(q "SELECT count(*) FROM command_fw.audit_log WHERE blocked AND command_type = 'READ_FILE';")
+if [ "$count" = "0" ]; then
+    pass "blocked pg_read_file not persisted in audit_log (transaction rollback)"
+else
+    fail "expected 0 audit_log rows for blocked pg_read_file, got: $count"
+fi
+
+echo ""
 echo "=== Regular SQL unaffected ==="
 
 echo ""
-echo "--- Test 28: SELECT works ---"
+echo "--- Test 35: SELECT works ---"
 result=$(psql -t -A -c "SELECT 42;")
 if [ "$result" = "42" ]; then
     pass "Regular SELECT works"
@@ -373,7 +441,7 @@ else
 fi
 
 echo ""
-echo "--- Test 29: CREATE TABLE / INSERT / SELECT work ---"
+echo "--- Test 36: CREATE TABLE / INSERT / SELECT work ---"
 count=$(psql -t -A <<'SQL' | tail -1
 CREATE TEMP TABLE _docker_test (id int);
 INSERT INTO _docker_test VALUES (1), (2), (3);
