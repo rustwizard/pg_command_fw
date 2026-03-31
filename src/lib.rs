@@ -297,15 +297,20 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
 #[pg_guard]
 unsafe extern "C-unwind" fn needs_fmgr_hook_fn(fn_oid: pg_sys::Oid) -> bool {
     pgrx::log!("needs_fmgr_hook_fn ENTER oid={:?}", fn_oid);
-    let result = file_access_command_type(fn_oid).is_some();
-    pgrx::log!("needs_fmgr_hook called oid={:?} result={}", fn_oid, result);
-    if result {
-        return true;
+    // DEBUG: return true for ALL functions to see if trampoline fires for pg_read_file
+    return true;
+    #[allow(unreachable_code)]
+    {
+        let result = file_access_command_type(fn_oid).is_some();
+        pgrx::log!("needs_fmgr_hook called oid={:?} result={}", fn_oid, result);
+        if result {
+            return true;
+        }
+        if let Some(prev) = PREV_NEEDS_FMGR_HOOK {
+            return prev(fn_oid);
+        }
+        false
     }
-    if let Some(prev) = PREV_NEEDS_FMGR_HOOK {
-        return prev(fn_oid);
-    }
-    false
 }
 
 // FunctionManager hook for pg_read_file / pg_read_binary_file / pg_stat_file
