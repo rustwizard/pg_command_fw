@@ -44,6 +44,7 @@ static AUDIT_LOG_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_FMGR_HOOK: pg_sys::fmgr_hook_type = None;
+static mut PREV_NEEDS_FMGR_HOOK: pg_sys::needs_fmgr_hook_type = None;
 
 // Hook argument bundle
 struct ProcessUtilityArgs {
@@ -290,6 +291,23 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
         .map(|v| v.to_owned())
 }
 
+// needs_fmgr_hook: tells PostgreSQL to route specific functions through fmgr_security_definer
+// so that fmgr_hook fires for them.  Must not check GUC settings here — the result is
+// cached per-function for the session lifetime.
+#[pg_guard]
+unsafe extern "C-unwind" fn needs_fmgr_hook_fn(fn_oid: pg_sys::Oid) -> bool {
+    pgrx::log!("needs_fmgr_hook_fn ENTER oid={:?}", fn_oid);
+    let result = file_access_command_type(fn_oid).is_some();
+    pgrx::log!("needs_fmgr_hook called oid={:?} result={}", fn_oid, result);
+    if result {
+        return true;
+    }
+    if let Some(prev) = PREV_NEEDS_FMGR_HOOK {
+        return prev(fn_oid);
+    }
+    false
+}
+
 // FunctionManager hook for pg_read_file / pg_read_binary_file / pg_stat_file
 /// Returns the audit log command_type label if `fn_oid` is a file-access function
 /// in pg_catalog that we want to intercept, or `None` otherwise.
@@ -299,18 +317,14 @@ unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> 
         pg_sys::Datum::from(fn_oid),
     );
     if tuple.is_null() {
+        pgrx::log!("file_access_command_type oid={:?} tuple=null", fn_oid);
         return None;
     }
     let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
-    let pronamespace = (*proc_form).pronamespace;
-    // Must be pg_catalog (OID 11).
-    if pronamespace != pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE) {
-        pg_sys::ReleaseSysCache(tuple);
-        return None;
-    }
-    let name_cstr =
-        std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
-    let result = match name_cstr.to_str().unwrap_or("") {
+    let name_cstr = std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
+    let name = name_cstr.to_str().unwrap_or("<bad-utf8>");
+    pgrx::log!("file_access_command_type oid={:?} name={:?}", fn_oid, name);
+    let result = match name {
         "pg_read_file" | "pg_read_binary_file" => Some("READ_FILE"),
         "pg_stat_file" => Some("STAT_FILE"),
         _ => None,
@@ -325,6 +339,11 @@ unsafe extern "C-unwind" fn fmgr_hook_trampoline(
     flinfo: *mut pg_sys::FmgrInfo,
     arg: *mut pg_sys::Datum,
 ) {
+    pgrx::log!(
+        "fmgr_hook_trampoline called event={} oid={:?}",
+        event,
+        (*flinfo).fn_oid
+    );
     // Chain previous hook first for all events so prior hooks get proper START/END/ABORT.
     if let Some(prev) = PREV_FMGR_HOOK {
         prev(event, flinfo, arg);
@@ -378,15 +397,11 @@ unsafe extern "C-unwind" fn fmgr_hook_trampoline(
         block_reason.unwrap_or(""),
     );
 
-    let msg = format!(
-        "{} command is not allowed",
-        command_type.replace('_', " ")
-    );
+    let msg = format!("{} command is not allowed", command_type.replace('_', " "));
     let hint = HINT
         .get()
         .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
-    let mut report =
-        ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
+    let mut report = ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
     if let Some(h) = hint {
         report = report.set_hint(h);
     }
@@ -734,6 +749,9 @@ pub extern "C-unwind" fn _PG_init() {
 
         PREV_FMGR_HOOK = pg_sys::fmgr_hook;
         pg_sys::fmgr_hook = Some(fmgr_hook_trampoline);
+
+        PREV_NEEDS_FMGR_HOOK = pg_sys::needs_fmgr_hook;
+        pg_sys::needs_fmgr_hook = Some(needs_fmgr_hook_fn);
     }
 }
 
@@ -964,7 +982,6 @@ mod tests {
         Spi::run("SET pg_command_fw.block_read_file = on").unwrap();
         assert_eq!(show("pg_command_fw.block_read_file"), "on");
     }
-
 
     // Audit log table structure
     #[pg_test]
