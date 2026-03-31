@@ -1,6 +1,8 @@
 # pg_command_fw
 
-A PostgreSQL extension that intercepts and optionally blocks DDL and utility commands via a `ProcessUtility` hook. Each command category is independently controlled by a GUC flag.
+A PostgreSQL extension that intercepts and optionally blocks DDL, utility commands, and dangerous built-in functions. Two hooks are used: `ProcessUtility` for DDL/utility statements, and the post-parse analyze hook for function calls such as `pg_read_file`. Each command category is independently controlled by a GUC flag.
+
+**Supported PostgreSQL versions: 15–18.**
 
 ## Building
 
@@ -13,7 +15,7 @@ cargo install cargo-pgrx --version 0.17.0 --locked
 cargo pgrx init          # downloads and configures a managed PostgreSQL instance
 ```
 
-Build for a specific PostgreSQL version (13–18):
+Build for a specific PostgreSQL version (15–18):
 
 ```bash
 cargo build --features pg17
@@ -35,7 +37,7 @@ Spins up a temporary PostgreSQL process, runs all `#[pg_test]` functions, then s
 cargo pgrx test --features pg17
 ```
 
-To run against a different PostgreSQL version replace `pg17` with `pg13`–`pg18`.
+To run against a different PostgreSQL version replace `pg17` with `pg15`–`pg18`.
 
 ### Integration tests (Docker)
 
@@ -71,6 +73,7 @@ CREATE EXTENSION pg_command_fw;
 | `LOAD` | `pg_command_fw.block_load` | `on` | Everyone including superusers |
 | `COPY … PROGRAM` | `pg_command_fw.block_copy_program` | `on` | Everyone including superusers |
 | Plain `COPY` | `pg_command_fw.block_copy` | `off` | Non-superusers (opt-in) |
+| `pg_read_file` / `pg_read_binary_file` / `pg_stat_file` | `pg_command_fw.block_read_file` | `on` | Everyone including superusers |
 
 Superusers are always exempt from non-superuser checks unless they appear in `pg_command_fw.blocked_roles`.
 
@@ -104,6 +107,9 @@ Block `COPY … TO/FROM PROGRAM` for all roles including superusers. Prevents sh
 **`pg_command_fw.block_copy`** (bool, default `off`)
 Block plain `COPY` (to/from file or stdout) for non-superusers. Superusers are exempt unless listed in `blocked_roles`.
 
+**`pg_command_fw.block_read_file`** (bool, default `on`)
+Block calls to `pg_read_file()`, `pg_read_binary_file()`, and `pg_stat_file()` for all roles including superusers. These functions allow reading arbitrary server-side files and represent the same data-exfiltration risk as `COPY TO FILE`. Enforced via the post-parse analyze hook, so calls are caught before planning regardless of how they are nested in the query.
+
 ### Cross-category
 
 **`pg_command_fw.blocked_roles`** (string, default empty)
@@ -126,7 +132,7 @@ Every intercepted command (allowed or blocked) is recorded in `command_fw.audit_
 | `session_user_name` | text | Session-level user |
 | `current_user_name` | text | Current (possibly SET ROLE) user |
 | `query_text` | text | Original query string |
-| `command_type` | text | e.g. `TRUNCATE`, `DROP_TABLE`, `ALTER_SYSTEM`, `LOAD`, `COPY_PROGRAM`, `COPY` |
+| `command_type` | text | e.g. `TRUNCATE`, `DROP_TABLE`, `ALTER_SYSTEM`, `LOAD`, `COPY_PROGRAM`, `COPY`, `READ_FILE`, `STAT_FILE` |
 | `target_schema` | text | Schema that triggered the block (DROP TABLE with `production_schemas`) |
 | `target_object` | text | Object name (LOAD: library path) |
 | `client_addr` | inet | Client IP address |

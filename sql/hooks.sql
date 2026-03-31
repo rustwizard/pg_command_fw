@@ -23,6 +23,7 @@ CREATE TABLE command_fw.audit_log (
     current_user_name text        NOT NULL,
     query_text        text        NOT NULL,
     -- Command category: 'TRUNCATE' | 'DROP_TABLE' | 'ALTER_SYSTEM' | 'LOAD' | 'COPY_PROGRAM'
+    --                   | 'COPY' | 'READ_FILE' | 'STAT_FILE'
     command_type      text        NOT NULL,
     -- For DROP_TABLE: the production schema that triggered the block (NULL otherwise).
     target_schema     text,
@@ -33,7 +34,8 @@ CREATE TABLE command_fw.audit_log (
     application_name  text,
     blocked           bool        NOT NULL,
     -- NULL when not blocked; one of: 'role_listed', 'truncate_non_superuser',
-    -- 'drop_production_table', 'alter_system', 'load', 'copy_program' when blocked.
+    -- 'drop_production_table', 'alter_system', 'load', 'copy_program', 'copy',
+    -- 'read_file' when blocked.
     block_reason      text,
     PRIMARY KEY (id)
 );

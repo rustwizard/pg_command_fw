@@ -29,6 +29,8 @@ static BLOCK_LOAD: GucSetting<bool> = GucSetting::<bool>::new(true);
 static BLOCK_COPY_PROGRAM: GucSetting<bool> = GucSetting::<bool>::new(true);
 // COPY (plain, non-PROGRAM): blocked for non-superusers (opt-in).
 static BLOCK_COPY: GucSetting<bool> = GucSetting::<bool>::new(false);
+// pg_read_file / pg_read_binary_file / pg_stat_file: blocked for all users including superusers.
+static BLOCK_READ_FILE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // Cross-category settings
 // Comma-separated list of roles that are always blocked, including superusers.
@@ -41,6 +43,7 @@ static HINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(No
 static AUDIT_LOG_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
+static mut PREV_POST_PARSE_ANALYZE_HOOK: pg_sys::post_parse_analyze_hook_type = None;
 
 // Hook argument bundle
 struct ProcessUtilityArgs {
@@ -285,6 +288,147 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
         .to_str()
         .ok()
         .map(|v| v.to_owned())
+}
+
+// Returns the audit log command_type label if `fn_oid` resolves to one of the
+// file-access functions we block, or `None` otherwise.
+unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> {
+    let tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(fn_oid),
+    );
+    if tuple.is_null() {
+        return None;
+    }
+    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+    let name_cstr = std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
+    let name = name_cstr.to_str().unwrap_or("");
+    let result = match name {
+        "pg_read_file" | "pg_read_binary_file" => Some("READ_FILE"),
+        "pg_stat_file" => Some("STAT_FILE"),
+        _ => None,
+    };
+    pg_sys::ReleaseSysCache(tuple);
+    result
+}
+
+// Thin wrappers around expression_tree_walker / query_tree_walker.
+// PG16 renamed both to *_impl (they became macros in the headers), so the
+// old symbol names are only available as real exports in PG15.
+type WalkerFn = Option<unsafe extern "C-unwind" fn(*mut pg_sys::Node, *mut std::ffi::c_void) -> bool>;
+
+#[cfg(feature = "pg15")]
+extern "C" {
+    fn expression_tree_walker(
+        node: *mut pg_sys::Node,
+        walker: WalkerFn,
+        context: *mut std::ffi::c_void,
+    ) -> bool;
+    fn query_tree_walker(
+        query: *mut pg_sys::Query,
+        walker: WalkerFn,
+        context: *mut std::ffi::c_void,
+        flags: std::ffi::c_int,
+    ) -> bool;
+}
+
+#[inline]
+unsafe fn expr_tree_walk(node: *mut pg_sys::Node, walker: WalkerFn, ctx: *mut std::ffi::c_void) -> bool {
+    #[cfg(feature = "pg15")]
+    { expression_tree_walker(node, walker, ctx) }
+    #[cfg(not(feature = "pg15"))]
+    { pg_sys::expression_tree_walker_impl(node, walker, ctx) }
+}
+
+#[inline]
+unsafe fn query_tree_walk(query: *mut pg_sys::Query, walker: WalkerFn, ctx: *mut std::ffi::c_void) -> bool {
+    #[cfg(feature = "pg15")]
+    { query_tree_walker(query, walker, ctx, 0) }
+    #[cfg(not(feature = "pg15"))]
+    { pg_sys::query_tree_walker_impl(query, walker, ctx, 0) }
+}
+
+// Walker callback: returns true (stop) when a blocked FuncExpr is found.
+// Stores the command_type label in the context pointer.
+unsafe extern "C-unwind" fn blocked_func_walker(
+    node: *mut pg_sys::Node,
+    context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if is_a(node, pg_sys::NodeTag::T_FuncExpr) {
+        let fe = node as *mut pg_sys::FuncExpr;
+        if let Some(ct) = file_access_command_type((*fe).funcid) {
+            *(context as *mut Option<&'static str>) = Some(ct);
+            return true;
+        }
+    }
+    // Descend into subqueries (SubLink, RTE_SUBQUERY, etc.)
+    if is_a(node, pg_sys::NodeTag::T_Query) {
+        return query_tree_walk(node as *mut pg_sys::Query, Some(blocked_func_walker), context);
+    }
+    expr_tree_walk(node, Some(blocked_func_walker), context)
+}
+
+// Scan the entire query tree for any call to a blocked file-access function.
+unsafe fn query_find_blocked_func(query: *mut pg_sys::Query) -> Option<&'static str> {
+    let mut result: Option<&'static str> = None;
+    let ctx = &mut result as *mut Option<&'static str> as *mut std::ffi::c_void;
+    query_tree_walk(query, Some(blocked_func_walker), ctx);
+    result
+}
+
+// post_parse_analyze_hook trampoline (PG14+ signature: includes jstate)
+#[pg_guard]
+unsafe extern "C-unwind" fn post_parse_analyze_hook_fn(
+    pstate: *mut pg_sys::ParseState,
+    query: *mut pg_sys::Query,
+    jstate: *mut pg_sys::JumbleState,
+) {
+    if FW_ENABLED.get() && BLOCK_READ_FILE.get() && !query.is_null() {
+        if let Some(command_type) = query_find_blocked_func(query) {
+            let current_user = get_current_username().unwrap_or_else(|| "unknown".to_string());
+            let session_user = get_session_username().unwrap_or_else(|| "unknown".to_string());
+            let in_blocked_list = is_role_blocked(&current_user);
+            let block_reason = if in_blocked_list {
+                Some("role_listed")
+            } else {
+                Some("read_file")
+            };
+            let query_text = if !pg_sys::debug_query_string.is_null() {
+                std::ffi::CStr::from_ptr(pg_sys::debug_query_string)
+                    .to_str()
+                    .unwrap_or("<non-utf8 query>")
+            } else {
+                "<unknown>"
+            };
+            write_audit_log(
+                &session_user,
+                &current_user,
+                query_text,
+                command_type,
+                None,
+                None,
+                true,
+                block_reason,
+            );
+            let msg = format!("{} command is not allowed", command_type.replace('_', " "));
+            let hint = HINT
+                .get()
+                .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
+            let mut report =
+                ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
+            if let Some(h) = hint {
+                report = report.set_hint(h);
+            }
+            report.report(PgLogLevel::ERROR);
+        }
+    }
+
+    if let Some(prev) = PREV_POST_PARSE_ANALYZE_HOOK {
+        prev(pstate, query, jstate);
+    }
 }
 
 // Role helper
@@ -578,6 +722,18 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pg_command_fw.block_read_file",
+        c"Block pg_read_file / pg_read_binary_file / pg_stat_file for all users",
+        c"When on (default), calls to pg_read_file(), pg_read_binary_file(), and \
+          pg_stat_file() are blocked for every role including superusers.  These \
+          functions allow reading arbitrary server-side files and represent the same \
+          data-exfiltration threat as COPY TO FILE.",
+        &BLOCK_READ_FILE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_string_guc(
         c"pg_command_fw.blocked_roles",
         c"Comma-separated list of roles always blocked from firewall-governed commands",
@@ -613,6 +769,9 @@ pub extern "C-unwind" fn _PG_init() {
     unsafe {
         PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
         pg_sys::ProcessUtility_hook = Some(hook_trampoline);
+
+        PREV_POST_PARSE_ANALYZE_HOOK = pg_sys::post_parse_analyze_hook;
+        pg_sys::post_parse_analyze_hook = Some(post_parse_analyze_hook_fn);
     }
 }
 
@@ -829,6 +988,19 @@ mod tests {
         assert_eq!(show("pg_command_fw.audit_log_enabled"), "off");
         Spi::run("SET pg_command_fw.audit_log_enabled = on").unwrap();
         assert_eq!(show("pg_command_fw.audit_log_enabled"), "on");
+    }
+
+    #[pg_test]
+    fn test_guc_block_read_file_default_on() {
+        assert_eq!(show("pg_command_fw.block_read_file"), "on");
+    }
+
+    #[pg_test]
+    fn test_guc_block_read_file_roundtrip() {
+        Spi::run("SET pg_command_fw.block_read_file = off").unwrap();
+        assert_eq!(show("pg_command_fw.block_read_file"), "off");
+        Spi::run("SET pg_command_fw.block_read_file = on").unwrap();
+        assert_eq!(show("pg_command_fw.block_read_file"), "on");
     }
 
     // Audit log table structure
