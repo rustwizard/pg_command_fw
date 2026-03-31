@@ -43,8 +43,7 @@ static HINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(No
 static AUDIT_LOG_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
-static mut PREV_FMGR_HOOK: pg_sys::fmgr_hook_type = None;
-static mut PREV_NEEDS_FMGR_HOOK: pg_sys::needs_fmgr_hook_type = None;
+static mut PREV_POST_PARSE_ANALYZE_HOOK: pg_sys::post_parse_analyze_hook_type = None;
 
 // Hook argument bundle
 struct ProcessUtilityArgs {
@@ -291,44 +290,19 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
         .map(|v| v.to_owned())
 }
 
-// needs_fmgr_hook: tells PostgreSQL to route specific functions through fmgr_security_definer
-// so that fmgr_hook fires for them.  Must not check GUC settings here — the result is
-// cached per-function for the session lifetime.
-#[pg_guard]
-unsafe extern "C-unwind" fn needs_fmgr_hook_fn(fn_oid: pg_sys::Oid) -> bool {
-    pgrx::log!("needs_fmgr_hook_fn ENTER oid={:?}", fn_oid);
-    // DEBUG: return true for ALL functions to see if trampoline fires for pg_read_file
-    return true;
-    #[allow(unreachable_code)]
-    {
-        let result = file_access_command_type(fn_oid).is_some();
-        pgrx::log!("needs_fmgr_hook called oid={:?} result={}", fn_oid, result);
-        if result {
-            return true;
-        }
-        if let Some(prev) = PREV_NEEDS_FMGR_HOOK {
-            return prev(fn_oid);
-        }
-        false
-    }
-}
-
-// FunctionManager hook for pg_read_file / pg_read_binary_file / pg_stat_file
-/// Returns the audit log command_type label if `fn_oid` is a file-access function
-/// in pg_catalog that we want to intercept, or `None` otherwise.
+// Returns the audit log command_type label if `fn_oid` resolves to one of the
+// file-access functions we block, or `None` otherwise.
 unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> {
     let tuple = pg_sys::SearchSysCache1(
         pg_sys::SysCacheIdentifier::PROCOID as _,
         pg_sys::Datum::from(fn_oid),
     );
     if tuple.is_null() {
-        pgrx::log!("file_access_command_type oid={:?} tuple=null", fn_oid);
         return None;
     }
     let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
     let name_cstr = std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
-    let name = name_cstr.to_str().unwrap_or("<bad-utf8>");
-    pgrx::log!("file_access_command_type oid={:?} name={:?}", fn_oid, name);
+    let name = name_cstr.to_str().unwrap_or("");
     let result = match name {
         "pg_read_file" | "pg_read_binary_file" => Some("READ_FILE"),
         "pg_stat_file" => Some("STAT_FILE"),
@@ -338,79 +312,123 @@ unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> 
     result
 }
 
+// Thin wrappers around expression_tree_walker / query_tree_walker.
+// PG16 renamed both to *_impl (they became macros in the headers), so the
+// old symbol names are only available as real exports in PG15.
+type WalkerFn = Option<unsafe extern "C-unwind" fn(*mut pg_sys::Node, *mut std::ffi::c_void) -> bool>;
+
+#[cfg(feature = "pg15")]
+extern "C" {
+    fn expression_tree_walker(
+        node: *mut pg_sys::Node,
+        walker: WalkerFn,
+        context: *mut std::ffi::c_void,
+    ) -> bool;
+    fn query_tree_walker(
+        query: *mut pg_sys::Query,
+        walker: WalkerFn,
+        context: *mut std::ffi::c_void,
+        flags: std::ffi::c_int,
+    ) -> bool;
+}
+
+#[inline]
+unsafe fn expr_tree_walk(node: *mut pg_sys::Node, walker: WalkerFn, ctx: *mut std::ffi::c_void) -> bool {
+    #[cfg(feature = "pg15")]
+    { expression_tree_walker(node, walker, ctx) }
+    #[cfg(not(feature = "pg15"))]
+    { pg_sys::expression_tree_walker_impl(node, walker, ctx) }
+}
+
+#[inline]
+unsafe fn query_tree_walk(query: *mut pg_sys::Query, walker: WalkerFn, ctx: *mut std::ffi::c_void) -> bool {
+    #[cfg(feature = "pg15")]
+    { query_tree_walker(query, walker, ctx, 0) }
+    #[cfg(not(feature = "pg15"))]
+    { pg_sys::query_tree_walker_impl(query, walker, ctx, 0) }
+}
+
+// Walker callback: returns true (stop) when a blocked FuncExpr is found.
+// Stores the command_type label in the context pointer.
+unsafe extern "C-unwind" fn blocked_func_walker(
+    node: *mut pg_sys::Node,
+    context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if is_a(node, pg_sys::NodeTag::T_FuncExpr) {
+        let fe = node as *mut pg_sys::FuncExpr;
+        if let Some(ct) = file_access_command_type((*fe).funcid) {
+            *(context as *mut Option<&'static str>) = Some(ct);
+            return true;
+        }
+    }
+    // Descend into subqueries (SubLink, RTE_SUBQUERY, etc.)
+    if is_a(node, pg_sys::NodeTag::T_Query) {
+        return query_tree_walk(node as *mut pg_sys::Query, Some(blocked_func_walker), context);
+    }
+    expr_tree_walk(node, Some(blocked_func_walker), context)
+}
+
+// Scan the entire query tree for any call to a blocked file-access function.
+unsafe fn query_find_blocked_func(query: *mut pg_sys::Query) -> Option<&'static str> {
+    let mut result: Option<&'static str> = None;
+    let ctx = &mut result as *mut Option<&'static str> as *mut std::ffi::c_void;
+    query_tree_walk(query, Some(blocked_func_walker), ctx);
+    result
+}
+
+// post_parse_analyze_hook trampoline (PG14+ signature: includes jstate)
 #[pg_guard]
-unsafe extern "C-unwind" fn fmgr_hook_trampoline(
-    event: pg_sys::FmgrHookEventType::Type,
-    flinfo: *mut pg_sys::FmgrInfo,
-    arg: *mut pg_sys::Datum,
+unsafe extern "C-unwind" fn post_parse_analyze_hook_fn(
+    pstate: *mut pg_sys::ParseState,
+    query: *mut pg_sys::Query,
+    jstate: *mut pg_sys::JumbleState,
 ) {
-    pgrx::log!(
-        "fmgr_hook_trampoline called event={} oid={:?}",
-        event,
-        (*flinfo).fn_oid
-    );
-    // Chain previous hook first for all events so prior hooks get proper START/END/ABORT.
-    if let Some(prev) = PREV_FMGR_HOOK {
-        prev(event, flinfo, arg);
+    if FW_ENABLED.get() && BLOCK_READ_FILE.get() && !query.is_null() {
+        if let Some(command_type) = query_find_blocked_func(query) {
+            let current_user = get_current_username().unwrap_or_else(|| "unknown".to_string());
+            let session_user = get_session_username().unwrap_or_else(|| "unknown".to_string());
+            let in_blocked_list = is_role_blocked(&current_user);
+            let block_reason = if in_blocked_list {
+                Some("role_listed")
+            } else {
+                Some("read_file")
+            };
+            let query_text = if !pg_sys::debug_query_string.is_null() {
+                std::ffi::CStr::from_ptr(pg_sys::debug_query_string)
+                    .to_str()
+                    .unwrap_or("<non-utf8 query>")
+            } else {
+                "<unknown>"
+            };
+            write_audit_log(
+                &session_user,
+                &current_user,
+                query_text,
+                command_type,
+                None,
+                None,
+                true,
+                block_reason,
+            );
+            let msg = format!("{} command is not allowed", command_type.replace('_', " "));
+            let hint = HINT
+                .get()
+                .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
+            let mut report =
+                ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
+            if let Some(h) = hint {
+                report = report.set_hint(h);
+            }
+            report.report(PgLogLevel::ERROR);
+        }
     }
 
-    if event != pg_sys::FmgrHookEventType::FHET_START {
-        return;
+    if let Some(prev) = PREV_POST_PARSE_ANALYZE_HOOK {
+        prev(pstate, query, jstate);
     }
-    if !FW_ENABLED.get() || !BLOCK_READ_FILE.get() {
-        return;
-    }
-
-    let command_type = match file_access_command_type((*flinfo).fn_oid) {
-        Some(ct) => ct,
-        None => return,
-    };
-
-    let current_user = get_current_username().unwrap_or_else(|| "unknown".to_string());
-    let session_user = get_session_username().unwrap_or_else(|| "unknown".to_string());
-    let in_blocked_list = is_role_blocked(&current_user);
-
-    let block_reason = if in_blocked_list {
-        Some("role_listed")
-    } else {
-        Some("read_file")
-    };
-
-    let query_text = if !pg_sys::debug_query_string.is_null() {
-        std::ffi::CStr::from_ptr(pg_sys::debug_query_string)
-            .to_str()
-            .unwrap_or("<non-utf8 query>")
-    } else {
-        "<unknown>"
-    };
-
-    write_audit_log(
-        &session_user,
-        &current_user,
-        query_text,
-        command_type,
-        None,
-        None,
-        true,
-        block_reason,
-    );
-
-    pgrx::log!(
-        "blocked {} user={:?} reason={:?}",
-        command_type,
-        current_user,
-        block_reason.unwrap_or(""),
-    );
-
-    let msg = format!("{} command is not allowed", command_type.replace('_', " "));
-    let hint = HINT
-        .get()
-        .and_then(|cstr| cstr.to_str().ok().map(str::to_owned));
-    let mut report = ErrorReport::new(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, msg, "");
-    if let Some(h) = hint {
-        report = report.set_hint(h);
-    }
-    report.report(PgLogLevel::ERROR);
 }
 
 // Role helper
@@ -752,11 +770,8 @@ pub extern "C-unwind" fn _PG_init() {
         PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
         pg_sys::ProcessUtility_hook = Some(hook_trampoline);
 
-        PREV_FMGR_HOOK = pg_sys::fmgr_hook;
-        pg_sys::fmgr_hook = Some(fmgr_hook_trampoline);
-
-        PREV_NEEDS_FMGR_HOOK = pg_sys::needs_fmgr_hook;
-        pg_sys::needs_fmgr_hook = Some(needs_fmgr_hook_fn);
+        PREV_POST_PARSE_ANALYZE_HOOK = pg_sys::post_parse_analyze_hook;
+        pg_sys::post_parse_analyze_hook = Some(post_parse_analyze_hook_fn);
     }
 }
 
