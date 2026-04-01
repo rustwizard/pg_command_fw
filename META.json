@@ -1,0 +1,39 @@
+{
+   "name": "pg_command_fw",
+   "abstract": "PostgreSQL extension that intercepts and blocks DDL, utility commands, and dangerous built-in functions via configurable hooks",
+   "description": "A PostgreSQL security extension that enforces a configurable DDL/utility command firewall. Uses the ProcessUtility hook to intercept TRUNCATE, DROP TABLE, ALTER SYSTEM, LOAD, and COPY commands, and the post-parse analyze hook to block pg_read_file/pg_read_binary_file/pg_stat_file calls. Supports per-category GUC flags, superuser bypass, per-role blocklists, production schema scoping, audit logging, and custom error hints.",
+   "version": "0.1.0",
+   "maintainer": "RustWizard <rustwizard.0@gmail.com>",
+   "license": "bsd",
+   "provides": {
+      "pg_command_fw": {
+         "abstract": "DDL/utility command firewall via ProcessUtility and post-parse analyze hooks",
+         "file": "pg_command_fw.control",
+         "version": "0.1.0"
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/rustwizard/pg_command_fw",
+      "bugtracker": {
+         "web": "https://github.com/rustwizard/pg_command_fw/issues"
+      },
+      "repository": {
+         "url": "https://github.com/rustwizard/pg_command_fw.git",
+         "web": "https://github.com/rustwizard/pg_command_fw",
+         "type": "git"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "15.0.0"
+         }
+      }
+   },
+   "tags": ["security", "ddl", "firewall", "hook", "pgrx", "rust", "truncate", "copy", "alter-system"],
+   "generated_by": "hand",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/spec/"
+   }
+}

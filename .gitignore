@@ -4,6 +4,7 @@
 *.iml
 **/*.rs.bk
 Cargo.lock
+*.zip
 tests/pg_regress/results
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out
