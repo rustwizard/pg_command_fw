@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-pgrx, then immediately purge the downloaded crate registry to free space
-RUN cargo install cargo-pgrx --version 0.17.0 --locked && \
+RUN cargo install cargo-pgrx --version 0.20.1 --locked && \
     rm -rf /root/.cargo/registry/src /root/.cargo/registry/cache
 
 WORKDIR /build

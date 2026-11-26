@@ -2,7 +2,7 @@
 
 use pgrx::datum::DatumWithOid;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
-use pgrx::is_a;
+use pgrx::pg_sys::PgNode;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::prelude::*;
@@ -49,7 +49,6 @@ static mut PREV_POST_PARSE_ANALYZE_HOOK: pg_sys::post_parse_analyze_hook_type = 
 struct ProcessUtilityArgs {
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const std::os::raw::c_char,
-    #[cfg(not(feature = "pg13"))]
     read_only_tree: bool,
     context: pg_sys::ProcessUtilityContext::Type,
     params: pg_sys::ParamListInfo,
@@ -82,7 +81,7 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     let is_super = pg_sys::superuser();
 
     // COPY TO/FROM PROGRAM or plain COPY
-    if is_a(node, pg_sys::NodeTag::T_CopyStmt) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_CopyStmt) {
         let copy_stmt = node as *mut pg_sys::CopyStmt;
         if (*copy_stmt).is_program {
             let block_reason = if in_blocked_list {
@@ -119,7 +118,7 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     }
 
     // ALTER SYSTEM
-    if is_a(node, pg_sys::NodeTag::T_AlterSystemStmt) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_AlterSystemStmt) {
         let block_reason = if in_blocked_list {
             Some("role_listed")
         } else if BLOCK_ALTER_SYSTEM.get() {
@@ -136,7 +135,7 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     }
 
     // LOAD
-    if is_a(node, pg_sys::NodeTag::T_LoadStmt) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_LoadStmt) {
         let load_stmt = node as *mut pg_sys::LoadStmt;
         let filename = if !(*load_stmt).filename.is_null() {
             Some(
@@ -163,7 +162,7 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     }
 
     // TRUNCATE (non-superusers)
-    if is_a(node, pg_sys::NodeTag::T_TruncateStmt) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_TruncateStmt) {
         let block_reason = if in_blocked_list {
             Some("role_listed")
         } else if BLOCK_TRUNCATE.get() && !is_super {
@@ -180,7 +179,7 @@ unsafe fn check_firewall(node: *mut pg_sys::Node, current_user: &str) -> Option<
     }
 
     // DROP TABLE (non-superusers, optionally scoped to production schemas)
-    if is_a(node, pg_sys::NodeTag::T_DropStmt) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_DropStmt) {
         let drop_stmt = node as *mut pg_sys::DropStmt;
         if (*drop_stmt).removeType != pg_sys::ObjectType::OBJECT_TABLE {
             return None;
@@ -264,8 +263,7 @@ unsafe fn extract_schemas_from_drop_stmt(drop_stmt: *mut pg_sys::DropStmt) -> Ve
     schemas
 }
 
-/// Extract the string value from a T_String (PG14+) or T_String/Value (PG13) node pointer.
-#[cfg(not(feature = "pg13"))]
+/// Extract the string value from a T_String node pointer.
 unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> {
     let s = ptr as *mut pg_sys::String;
     if (*s).sval.is_null() {
@@ -277,18 +275,6 @@ unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> 
         .map(|v| v.to_owned())
 }
 
-#[cfg(feature = "pg13")]
-unsafe fn extract_string_node(ptr: *mut std::os::raw::c_void) -> Option<String> {
-    let v = ptr as *mut pg_sys::Value;
-    let str_ptr = (*v).val.str_;
-    if str_ptr.is_null() {
-        return None;
-    }
-    std::ffi::CStr::from_ptr(str_ptr)
-        .to_str()
-        .ok()
-        .map(|v| v.to_owned())
-}
 
 // Returns the audit log command_type label if `fn_oid` resolves to one of the
 // file-access functions we block, or `None` otherwise.
@@ -300,7 +286,7 @@ unsafe fn file_access_command_type(fn_oid: pg_sys::Oid) -> Option<&'static str> 
     if tuple.is_null() {
         return None;
     }
-    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+    let proc_form = pg_sys::GETSTRUCT!(tuple).get().cast::<pg_sys::FormData_pg_proc>();
     let name_cstr = std::ffi::CStr::from_ptr((*proc_form).proname.data.as_ptr());
     let name = name_cstr.to_str().unwrap_or("");
     let result = match name {
@@ -357,7 +343,7 @@ unsafe extern "C-unwind" fn blocked_func_walker(
     if node.is_null() {
         return false;
     }
-    if is_a(node, pg_sys::NodeTag::T_FuncExpr) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_FuncExpr) {
         let fe = node as *mut pg_sys::FuncExpr;
         if let Some(ct) = file_access_command_type((*fe).funcid) {
             *(context as *mut Option<&'static str>) = Some(ct);
@@ -365,7 +351,7 @@ unsafe extern "C-unwind" fn blocked_func_walker(
         }
     }
     // Descend into subqueries (SubLink, RTE_SUBQUERY, etc.)
-    if is_a(node, pg_sys::NodeTag::T_Query) {
+    if pg_sys::Node::is_a_ptr(node, pg_sys::NodeTag::T_Query) {
         return query_tree_walk(node as *mut pg_sys::Query, Some(blocked_func_walker), context);
     }
     expr_tree_walk(node, Some(blocked_func_walker), context)
@@ -380,11 +366,16 @@ unsafe fn query_find_blocked_func(query: *mut pg_sys::Query) -> Option<&'static 
 }
 
 // post_parse_analyze_hook trampoline (PG14+ signature: includes jstate)
+#[cfg(feature = "pg19")]
+type JumbleStatePtr = *const pg_sys::JumbleState;
+#[cfg(not(feature = "pg19"))]
+type JumbleStatePtr = *mut pg_sys::JumbleState;
+
 #[pg_guard]
 unsafe extern "C-unwind" fn post_parse_analyze_hook_fn(
     pstate: *mut pg_sys::ParseState,
     query: *mut pg_sys::Query,
-    jstate: *mut pg_sys::JumbleState,
+    jstate: JumbleStatePtr,
 ) {
     if FW_ENABLED.get() && BLOCK_READ_FILE.get() && !query.is_null() {
         if let Some(command_type) = query_find_blocked_func(query) {
@@ -489,29 +480,6 @@ unsafe fn command_firewall_process_utility(args: ProcessUtilityArgs) {
         }
     }
 
-    #[cfg(feature = "pg13")]
-    match PREV_PROCESS_UTILITY_HOOK {
-        Some(prev) => prev(
-            args.pstmt,
-            args.query_string,
-            args.context,
-            args.params,
-            args.query_env,
-            args.dest,
-            args.qc,
-        ),
-        None => pg_sys::standard_ProcessUtility(
-            args.pstmt,
-            args.query_string,
-            args.context,
-            args.params,
-            args.query_env,
-            args.dest,
-            args.qc,
-        ),
-    }
-
-    #[cfg(not(feature = "pg13"))]
     match PREV_PROCESS_UTILITY_HOOK {
         Some(prev) => prev(
             args.pstmt,
@@ -586,31 +554,6 @@ fn write_audit_log(
 
 // Hook trampolines
 #[pg_guard]
-#[cfg(feature = "pg13")]
-unsafe extern "C-unwind" fn hook_trampoline(
-    pstmt: *mut pg_sys::PlannedStmt,
-    query_string: *const std::os::raw::c_char,
-    context: pg_sys::ProcessUtilityContext::Type,
-    params: pg_sys::ParamListInfo,
-    query_env: *mut pg_sys::QueryEnvironment,
-    dest: *mut pg_sys::DestReceiver,
-    qc: *mut pg_sys::QueryCompletion,
-) {
-    unsafe {
-        command_firewall_process_utility(ProcessUtilityArgs {
-            pstmt,
-            query_string,
-            context,
-            params,
-            query_env,
-            dest,
-            qc,
-        });
-    }
-}
-
-#[pg_guard]
-#[cfg(not(feature = "pg13"))]
 unsafe extern "C-unwind" fn hook_trampoline(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const std::os::raw::c_char,

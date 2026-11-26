@@ -2,7 +2,7 @@
 
 A PostgreSQL extension that intercepts and optionally blocks DDL, utility commands, and dangerous built-in functions. Two hooks are used: `ProcessUtility` for DDL/utility statements, and the post-parse analyze hook for function calls such as `pg_read_file`. Each command category is independently controlled by a GUC flag.
 
-**Supported PostgreSQL versions: 15–18.**
+**Supported PostgreSQL versions: 15–19.**
 
 ## Building
 
@@ -11,11 +11,11 @@ The extension is built with [pgrx](https://github.com/pgcentralfoundation/pgrx).
 **Prerequisites:** Rust toolchain, `clang`, PostgreSQL server dev headers.
 
 ```bash
-cargo install cargo-pgrx --version 0.17.0 --locked
+cargo install cargo-pgrx --version 0.20.1 --locked
 cargo pgrx init          # downloads and configures a managed PostgreSQL instance
 ```
 
-Build for a specific PostgreSQL version (15–18):
+Build for a specific PostgreSQL version (15–19):
 
 ```bash
 cargo build --features pg17
@@ -37,7 +37,7 @@ Spins up a temporary PostgreSQL process, runs all `#[pg_test]` functions, then s
 cargo pgrx test --features pg17
 ```
 
-To run against a different PostgreSQL version replace `pg17` with `pg15`–`pg18`.
+To run against a different PostgreSQL version replace `pg17` with `pg15`–`pg19`.
 
 ### Integration tests (Docker)
 
